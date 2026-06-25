@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: learnlink
+      POSTGRES_USER: learnlink
+      POSTGRES_PASSWORD: learnlink
+    ports:
+      - "5432:5432"
+    volumes:
+      - learnlink-postgres:/var/lib/postgresql/data
+      - ./postgres/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+
+  gateway:
+    build: ../learnlink-backend-gateway
+    env_file: ../.env
+    ports:
+      - "4000:4000"
+    depends_on:
+      - postgres
+
+  community:
+    build: ../learnlink-service-community
+    env_file: ../.env
+    ports:
+      - "4100:4100"
+    depends_on:
+      - postgres
+
+  courses:
+    build: ../learnlink-service-courses
+    env_file: ../.env
+    ports:
+      - "4200:4200"
+    depends_on:
+      - postgres
+
+  jobs:
+    build: ../learnlink-service-jobs
+    env_file: ../.env
+    ports:
+      - "4300:4300"
+    depends_on:
+      - postgres
+
+  agents:
+    build: ../learnlink-service-agents
+    env_file: ../.env
+    ports:
+      - "5005:5005"
+
+volumes:
+  learnlink-postgres:
+
