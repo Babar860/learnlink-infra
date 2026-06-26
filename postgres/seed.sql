@@ -10,11 +10,11 @@ VALUES
   ('00000000-0000-0000-0000-000000000001', 'system@learnlink.local', 'LearnLink System', null, ARRAY['admin'], '{}'::jsonb, 1.000, true)
 ON CONFLICT (email) DO NOTHING;
 
-INSERT INTO communities (id, name, description, owner_id, subscriber_count)
+INSERT INTO communities (id, name, description, owner_id, allows_public_posts, subscriber_count)
 VALUES
-  ('10000000-0000-0000-0000-000000000001', 'AI and Data Community', 'Public discussion space.', '00000000-0000-0000-0000-000000000001', 128),
-  ('10000000-0000-0000-0000-000000000002', 'Career Switchers', 'AI-moderated posts from subscribed members.', '00000000-0000-0000-0000-000000000001', 91),
-  ('10000000-0000-0000-0000-000000000003', 'Student Help Desk', 'Ask questions and follow updates.', '00000000-0000-0000-0000-000000000001', 213)
+  ('10000000-0000-0000-0000-000000000001', 'AI and Data Community', 'Public discussion space.', '00000000-0000-0000-0000-000000000001', true, 128),
+  ('10000000-0000-0000-0000-000000000002', 'Career Switchers', 'AI-moderated posts from subscribed members.', '00000000-0000-0000-0000-000000000001', true, 91),
+  ('10000000-0000-0000-0000-000000000003', 'Student Help Desk', 'Owner-curated questions and updates.', '00000000-0000-0000-0000-000000000001', false, 213)
 ON CONFLICT (id) DO NOTHING;
 
 INSERT INTO channels (id, name, description, owner_id, is_paid, price_monthly)

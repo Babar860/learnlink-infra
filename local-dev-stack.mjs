@@ -83,14 +83,14 @@ const seedData = {
     { id: "job-product-associate", title: "Product Associate", company: "Growth Lab", location: "Hybrid", category: "product", is_active: true }
   ],
   communities: [
-    { id: "community-ai-data", name: "AI and Data Community", description: "Public discussion space.", subscriber_count: 128 },
-    { id: "community-career-switchers", name: "Career Switchers", description: "AI-moderated posts from subscribed members.", subscriber_count: 91 },
-    { id: "community-help-desk", name: "Student Help Desk", description: "Ask questions and follow updates.", subscriber_count: 213 }
+    { id: "community-ai-data", name: "AI and Data Community", description: "Public discussion space.", subscriber_count: 128, allows_public_posts: true, owner_id: "local-admin" },
+    { id: "community-career-switchers", name: "Career Switchers", description: "AI-moderated posts from subscribed members.", subscriber_count: 91, allows_public_posts: true, owner_id: "local-admin" },
+    { id: "community-help-desk", name: "Student Help Desk", description: "Owner-curated questions and updates.", subscriber_count: 213, allows_public_posts: false, owner_id: "local-admin" }
   ],
   channels: [
-    { id: "channel-product-careers", name: "Product Careers Channel", description: "Free creator channel.", is_paid: false, price_monthly: 0 },
-    { id: "channel-data-mentorship", name: "Premium Data Mentorship", description: "Paid private channel via Stripe.", is_paid: true, price_monthly: 2500 },
-    { id: "channel-teacher-materials", name: "Teacher Materials", description: "Async course-linked channel.", is_paid: false, price_monthly: 0 }
+    { id: "channel-product-careers", name: "Product Careers Channel", description: "Free creator channel.", is_paid: false, price_monthly: 0, owner_id: "local-admin" },
+    { id: "channel-data-mentorship", name: "Premium Data Mentorship", description: "Paid private channel via Stripe.", is_paid: true, price_monthly: 2500, owner_id: "local-admin" },
+    { id: "channel-teacher-materials", name: "Teacher Materials", description: "Async course-linked channel.", is_paid: false, price_monthly: 0, owner_id: "local-admin" }
   ],
   agent_logs: [
     { id: "agent-log-1", agent_name: "content-moderation-agent", trigger: "local_seed", status: "ok", created_at: new Date().toISOString() }
@@ -137,8 +137,15 @@ async function saveJsonData() {
 
 async function initStorage() {
   pgPool = await loadPgPool();
+  if (pgPool) await ensureRuntimeSchema();
   data = pgPool ? structuredClone(seedData) : await loadJsonData();
   await ensureAdminUser();
+}
+
+async function ensureRuntimeSchema() {
+  await pgPool.query("alter table communities add column if not exists allows_public_posts boolean not null default false");
+  await pgPool.query("update communities set allows_public_posts = true where name in ('AI and Data Community', 'Career Switchers')");
+  await pgPool.query("update communities set allows_public_posts = false where name = 'Student Help Desk'");
 }
 
 const json = (res, status, body) => {
@@ -314,7 +321,7 @@ async function listPosts() {
 async function listMyPosts(user) {
   if (pgPool) {
     const result = await pgPool.query(
-      `select p.id, p.content, p.media_url, p.post_type, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+      `select p.id, p.content, p.media_url, p.post_type, p.parent_id, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
               coalesce(u.name, 'LearnLink user') as author,
               p.post_type as source
        from posts p
@@ -336,14 +343,18 @@ async function createPost(user, body) {
   if (!content) return undefined;
   const postType = normalizePostType(body.post_type);
   const mediaUrls = Array.isArray(body.media_urls) ? body.media_urls.map((item) => String(item).trim()).filter(Boolean) : [];
+  const targetId = String(body.target_id ?? "").trim();
+  const target = await resolvePostTarget(user, postType, targetId);
+  if (target.error) return { error: target.error, message: target.message };
   const moderation = moderatePost(content);
+  const finalModeration = applyTargetApprovalRule(user, postType, target.record, moderation);
 
   if (pgPool) {
     const result = await pgPool.query(
-      `insert into posts (content, media_url, author_id, post_type, ai_moderation_status, ai_moderation_reason, ai_moderation_checked_at, published_at)
-       values ($1, $2, $3, $4, $5, $6, now(), $7)
-       returning id, content, media_url, post_type, ai_moderation_status, ai_moderation_reason, created_at`,
-      [content, mediaUrls, user.id, postType, moderation.status, moderation.reason, moderation.publishedAt]
+      `insert into posts (content, media_url, author_id, post_type, parent_id, ai_moderation_status, ai_moderation_reason, ai_moderation_checked_at, published_at)
+       values ($1, $2, $3, $4, $5, $6, $7, now(), $8)
+       returning id, content, media_url, post_type, parent_id, ai_moderation_status, ai_moderation_reason, created_at`,
+      [content, mediaUrls, user.id, postType, target.record?.id ?? null, finalModeration.status, finalModeration.reason, finalModeration.publishedAt]
     );
     const post = result.rows[0];
     return {
@@ -359,17 +370,177 @@ async function createPost(user, body) {
     author_id: user.id,
     author: user.name,
     source: postTypeLabel(postType),
-    status: moderation.status,
+    status: finalModeration.status,
     content,
     media_url: mediaUrls,
-    ai_moderation_status: moderation.status,
-    ai_moderation_reason: moderation.reason,
+    parent_id: target.record?.id,
+    ai_moderation_status: finalModeration.status,
+    ai_moderation_reason: finalModeration.reason,
     post_type: postType,
     created_at: new Date().toISOString()
   };
   data.posts.unshift(post);
   await saveJsonData();
   return post;
+}
+
+function applyTargetApprovalRule(user, postType, target, moderation) {
+  if (moderation.status !== "approved") return moderation;
+  if (postType === "community_post" && target?.owner_id && target.owner_id !== user.id) {
+    return {
+      status: "pending",
+      reason: "AI approved this community post. The community owner has been notified for final approval.",
+      publishedAt: null
+    };
+  }
+  return moderation;
+}
+
+async function resolvePostTarget(user, postType, targetId) {
+  if (postType === "platform_post") return { record: null };
+  if (!targetId) {
+    return {
+      error: postType === "channel_post" ? "channel_required" : "community_required",
+      message: postType === "channel_post" ? "Create or select one of your channels before posting." : "Select a public-posting community before posting."
+    };
+  }
+  if (postType === "channel_post") {
+    const channel = await getChannelById(targetId);
+    if (!channel) return { error: "channel_not_found", message: "Selected channel was not found." };
+    if (channel.owner_id !== user.id) return { error: "channel_owner_required", message: "Only the channel owner can create channel posts." };
+    return { record: channel };
+  }
+  const community = await getCommunityById(targetId);
+  if (!community) return { error: "community_not_found", message: "Selected community was not found." };
+  if (community.allows_public_posts === false) return { error: "community_posting_closed", message: "This community owner has not allowed everyone to post." };
+  return { record: community };
+}
+
+async function getChannelById(id) {
+  if (pgPool) {
+    const result = await pgPool.query("select id::text, name, description, owner_id::text, is_paid, price_monthly from channels where id = $1", [id]);
+    return result.rows[0];
+  }
+  return data.channels.find((channel) => channel.id === id);
+}
+
+async function getCommunityById(id) {
+  if (pgPool) {
+    const result = await pgPool.query("select id::text, name, description, owner_id::text, allows_public_posts, subscriber_count from communities where id = $1", [id]);
+    return result.rows[0];
+  }
+  return data.communities.find((community) => community.id === id);
+}
+
+async function listMyChannels(user) {
+  if (pgPool) {
+    const result = await pgPool.query("select id::text, name, description, owner_id::text, is_paid, price_monthly, created_at from channels where owner_id = $1 order by created_at desc", [user.id]);
+    return result.rows;
+  }
+  return data.channels.filter((channel) => channel.owner_id === user.id);
+}
+
+async function createChannel(user, body) {
+  const name = String(body.name ?? "").trim();
+  const description = String(body.description ?? "").trim() || "Creator channel";
+  if (!name) return { error: "channel_name_required", message: "Channel name is required." };
+  if (pgPool) {
+    const result = await pgPool.query(
+      `insert into channels (name, description, owner_id, is_paid, price_monthly)
+       values ($1, $2, $3, $4, $5)
+       returning id::text, name, description, owner_id::text, is_paid, price_monthly, created_at`,
+      [name, description, user.id, Boolean(body.is_paid), Number(body.price_monthly || 0)]
+    );
+    return { channel: result.rows[0] };
+  }
+  const channel = { id: crypto.randomUUID(), name, description, owner_id: user.id, is_paid: Boolean(body.is_paid), price_monthly: Number(body.price_monthly || 0), created_at: new Date().toISOString() };
+  data.channels.unshift(channel);
+  await saveJsonData();
+  return { channel };
+}
+
+async function searchPostableCommunities(query) {
+  const term = String(query ?? "").trim().toLowerCase();
+  if (pgPool) {
+    const result = await pgPool.query(
+      `select id::text, name, description, owner_id::text, allows_public_posts, subscriber_count
+       from communities
+       where allows_public_posts = true and ($1 = '' or lower(name) like '%' || $1 || '%' or lower(description) like '%' || $1 || '%')
+       order by subscriber_count desc, name asc
+       limit 25`,
+      [term]
+    );
+    return result.rows;
+  }
+  return data.communities
+    .filter((community) => community.allows_public_posts !== false)
+    .filter((community) => !term || `${community.name} ${community.description}`.toLowerCase().includes(term));
+}
+
+async function createCommunity(user, body) {
+  const name = String(body.name ?? "").trim();
+  const description = String(body.description ?? "").trim() || "Community space";
+  const allowsPublicPosts = Boolean(body.allows_public_posts);
+  if (!name) return { error: "community_name_required", message: "Community name is required." };
+  if (pgPool) {
+    const result = await pgPool.query(
+      `insert into communities (name, description, owner_id, is_public, allows_public_posts, subscriber_count)
+       values ($1, $2, $3, true, $4, 0)
+       returning id::text, name, description, owner_id::text, allows_public_posts, subscriber_count, created_at`,
+      [name, description, user.id, allowsPublicPosts]
+    );
+    return { community: result.rows[0] };
+  }
+  const community = { id: crypto.randomUUID(), name, description, owner_id: user.id, allows_public_posts: allowsPublicPosts, subscriber_count: 0, created_at: new Date().toISOString() };
+  data.communities.unshift(community);
+  await saveJsonData();
+  return { community };
+}
+
+async function approveOwnedCommunityPost(user, postId) {
+  if (pgPool) {
+    const result = await pgPool.query(
+      `update posts p
+       set ai_moderation_status = 'approved',
+           ai_moderation_reason = 'Approved by the community owner after AI analysis.',
+           published_at = now()
+       from communities c
+       where p.id = $1 and p.parent_id = c.id and c.owner_id = $2 and p.post_type = 'community_post'
+       returning p.id, p.ai_moderation_status, p.ai_moderation_reason`,
+      [postId, user.id]
+    );
+    return result.rows[0];
+  }
+  const post = data.posts.find((item) => item.id === postId);
+  const community = post ? data.communities.find((item) => item.id === post.parent_id) : undefined;
+  if (!post || !community || community.owner_id !== user.id) return undefined;
+  post.ai_moderation_status = "approved";
+  post.status = "approved";
+  post.ai_moderation_reason = "Approved by the community owner after AI analysis.";
+  await saveJsonData();
+  return post;
+}
+
+async function listOwnerReviewPosts(user) {
+  if (pgPool) {
+    const result = await pgPool.query(
+      `select p.id, p.content, p.media_url, p.post_type, p.parent_id, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+              coalesce(author.name, 'LearnLink user') as author,
+              c.name as community_name
+       from posts p
+       join communities c on c.id = p.parent_id
+       left join users author on author.id = p.author_id
+       where c.owner_id = $1 and p.post_type = 'community_post' and p.ai_moderation_status = 'pending'
+       order by p.created_at desc
+       limit 100`,
+      [user.id]
+    );
+    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: `Community: ${post.community_name}` }));
+  }
+  return data.posts
+    .filter((post) => post.post_type === "community_post" && post.ai_moderation_status === "pending")
+    .filter((post) => data.communities.find((community) => community.id === post.parent_id && community.owner_id === user.id))
+    .map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
 }
 
 async function searchPlatform(query) {
@@ -521,7 +692,15 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     const post = await createPost(user, await readJson(req));
-    json(res, post ? 202 : 400, post ? { post, notification: "local FCM placeholder" } : { error: "content_required" });
+    if (!post) {
+      json(res, 400, { error: "content_required" });
+      return;
+    }
+    if (post.error) {
+      json(res, 400, post);
+      return;
+    }
+    json(res, 202, { post, notification: "local FCM placeholder" });
     return;
   }
 
@@ -529,6 +708,53 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     json(res, 200, { posts: await listMyPosts(user) });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/posts/owner-review") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { posts: await listOwnerReviewPosts(user) });
+    return;
+  }
+
+  if (req.method === "GET" && req.url?.startsWith("/channels/mine")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { channels: await listMyChannels(user) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/channels") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createChannel(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "GET" && req.url?.startsWith("/communities/postable")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const url = requestUrl(req);
+    json(res, 200, { communities: await searchPostableCommunities(url.searchParams.get("q")) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/communities") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createCommunity(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/posts/") && req.url.endsWith("/approve")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[2];
+    const post = await approveOwnedCommunityPost(user, postId);
+    json(res, post ? 200 : 404, post ? { post } : { error: "post_not_found_or_not_owner" });
     return;
   }
 
@@ -561,7 +787,15 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     const post = await createPost(user, await readJson(req));
-    json(res, post ? 202 : 400, post ? { post } : { error: "content_required" });
+    if (!post) {
+      json(res, 400, { error: "content_required" });
+      return;
+    }
+    if (post.error) {
+      json(res, 400, post);
+      return;
+    }
+    json(res, 202, { post });
     return;
   }
 
@@ -569,6 +803,53 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     json(res, 200, { posts: await listMyPosts(user) });
+    return;
+  }
+
+  if (req.method === "GET" && req.url === "/community/posts/owner-review") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { posts: await listOwnerReviewPosts(user) });
+    return;
+  }
+
+  if (req.method === "GET" && req.url?.startsWith("/community/channels/mine")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { channels: await listMyChannels(user) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/community/channels") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createChannel(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "GET" && req.url?.startsWith("/community/communities/postable")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const url = requestUrl(req);
+    json(res, 200, { communities: await searchPostableCommunities(url.searchParams.get("q")) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/community/communities") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createCommunity(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/community/posts/") && req.url.endsWith("/approve")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[3];
+    const post = await approveOwnedCommunityPost(user, postId);
+    json(res, post ? 200 : 404, post ? { post } : { error: "post_not_found_or_not_owner" });
     return;
   }
 

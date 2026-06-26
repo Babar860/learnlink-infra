@@ -33,6 +33,7 @@ CREATE TABLE communities (
   description TEXT NOT NULL,
   owner_id UUID REFERENCES users(id),
   is_public BOOLEAN NOT NULL DEFAULT TRUE,
+  allows_public_posts BOOLEAN NOT NULL DEFAULT FALSE,
   subscriber_count INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
