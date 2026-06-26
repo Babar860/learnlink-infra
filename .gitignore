@@ -1,4 +1,5 @@
 .env
 *.log
 *.local
-
+local-dev-data.json
+node_modules/

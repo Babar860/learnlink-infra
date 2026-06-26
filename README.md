@@ -8,3 +8,6 @@ Docker Compose, PostgreSQL schema, feature flags, Firebase notes, and Stripe not
 docker compose up
 ```
 
+## Operations
+
+See `OPERATIONS.md` for all credentials, IDs, environment variables, and deployment requirements.
