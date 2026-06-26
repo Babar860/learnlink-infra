@@ -72,6 +72,8 @@ const seedData = {
       created_at: new Date().toISOString()
     }
   ],
+  post_likes: [],
+  post_comments: [],
   courses: [
     { id: "course-ai-foundations", title: "AI Career Foundations", description: "Recommended from onboarding answers.", category: "ai-and-data", is_paid: false },
     { id: "course-live-data", title: "Live Class: Data Skills", description: "Organization and grade filters supported.", category: "live-class", is_paid: false },
@@ -139,11 +141,28 @@ async function initStorage() {
   pgPool = await loadPgPool();
   if (pgPool) await ensureRuntimeSchema();
   data = pgPool ? structuredClone(seedData) : await loadJsonData();
+  data.post_likes ??= [];
+  data.post_comments ??= [];
   await ensureAdminUser();
 }
 
 async function ensureRuntimeSchema() {
   await pgPool.query("alter table communities add column if not exists allows_public_posts boolean not null default false");
+  await pgPool.query(`
+    create table if not exists post_likes (
+      post_id uuid not null references posts(id) on delete cascade,
+      user_id uuid not null references users(id) on delete cascade,
+      created_at timestamptz not null default now(),
+      primary key (post_id, user_id)
+    )`);
+  await pgPool.query(`
+    create table if not exists post_comments (
+      id uuid primary key default uuid_generate_v4(),
+      post_id uuid not null references posts(id) on delete cascade,
+      user_id uuid not null references users(id) on delete cascade,
+      content text not null,
+      created_at timestamptz not null default now()
+    )`);
   await pgPool.query("update communities set allows_public_posts = true where name in ('AI and Data Community', 'Career Switchers')");
   await pgPool.query("update communities set allows_public_posts = false where name = 'Student Help Desk'");
 }
@@ -301,41 +320,181 @@ async function createSession(user) {
   return token;
 }
 
-async function listPosts() {
+function enrichJsonPost(post, user) {
+  const comments = (data.post_comments || [])
+    .filter((comment) => comment.post_id === post.id)
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
+    .map((comment) => ({
+      ...comment,
+      author: data.users.find((item) => item.id === comment.user_id)?.name || "LearnLink user"
+    }));
+  return {
+    ...post,
+    source: post.source || postTypeLabel(post.post_type),
+    status: post.ai_moderation_status,
+    like_count: (data.post_likes || []).filter((like) => like.post_id === post.id).length,
+    comment_count: comments.length,
+    liked_by_me: Boolean(user && (data.post_likes || []).find((like) => like.post_id === post.id && like.user_id === user.id)),
+    comments: comments.slice(-10)
+  };
+}
+
+async function listPosts(user) {
   if (pgPool) {
     const result = await pgPool.query(
-      `select p.id, p.content, p.media_url, p.post_type, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+      `select p.id, p.author_id::text, p.content, p.media_url, p.post_type, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
               coalesce(u.name, 'LearnLink user') as author,
-              p.post_type as source
+              p.post_type as source,
+              count(distinct pl.user_id)::int as like_count,
+              count(distinct pc.id)::int as comment_count,
+              bool_or(pl.user_id = $1) as liked_by_me
        from posts p
        left join users u on u.id = p.author_id
+       left join post_likes pl on pl.post_id = p.id
+       left join post_comments pc on pc.post_id = p.id
        where p.ai_moderation_status = 'approved'
+       group by p.id, u.name
        order by p.created_at desc
-       limit 50`
+       limit 50`,
+      [user.id]
     );
-    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type) }));
+    return hydratePostComments(result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type), liked_by_me: Boolean(post.liked_by_me) })));
   }
-  return data.posts.filter((post) => post.ai_moderation_status === "approved").map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
+  return data.posts.filter((post) => post.ai_moderation_status === "approved").map((post) => enrichJsonPost(post, user));
 }
 
 async function listMyPosts(user) {
   if (pgPool) {
     const result = await pgPool.query(
-      `select p.id, p.content, p.media_url, p.post_type, p.parent_id, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+      `select p.id, p.author_id::text, p.content, p.media_url, p.post_type, p.parent_id, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
               coalesce(u.name, 'LearnLink user') as author,
-              p.post_type as source
+              p.post_type as source,
+              count(distinct pl.user_id)::int as like_count,
+              count(distinct pc.id)::int as comment_count,
+              bool_or(pl.user_id = $1) as liked_by_me
        from posts p
        left join users u on u.id = p.author_id
+       left join post_likes pl on pl.post_id = p.id
+       left join post_comments pc on pc.post_id = p.id
        where p.author_id = $1
+       group by p.id, u.name
        order by p.created_at desc
        limit 100`,
       [user.id]
     );
-    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type) }));
+    return hydratePostComments(result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type), liked_by_me: Boolean(post.liked_by_me) })));
   }
   return data.posts
     .filter((post) => post.author_id === user.id)
-    .map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
+    .map((post) => enrichJsonPost(post, user));
+}
+
+async function hydratePostComments(posts) {
+  if (!posts.length) return posts;
+  const ids = posts.map((post) => post.id);
+  const result = await pgPool.query(
+    `select pc.id::text, pc.post_id::text, pc.content, pc.created_at, coalesce(u.name, 'LearnLink user') as author
+     from post_comments pc
+     left join users u on u.id = pc.user_id
+     where pc.post_id = any($1::uuid[])
+     order by pc.created_at asc`,
+    [ids]
+  );
+  return posts.map((post) => {
+    const comments = result.rows.filter((comment) => comment.post_id === String(post.id)).slice(-10);
+    return { ...post, comments };
+  });
+}
+
+async function togglePostLike(user, postId) {
+  const existingPost = await getPostByIdForUser(postId, user);
+  if (!existingPost) return undefined;
+  if (pgPool) {
+    const deleted = await pgPool.query("delete from post_likes where post_id = $1 and user_id = $2 returning post_id", [postId, user.id]);
+    if (!deleted.rowCount) {
+      await pgPool.query("insert into post_likes (post_id, user_id) values ($1, $2) on conflict do nothing", [postId, user.id]);
+    }
+    return getPostByIdForUser(postId, user);
+  }
+  const index = data.post_likes.findIndex((like) => like.post_id === postId && like.user_id === user.id);
+  if (index >= 0) {
+    data.post_likes.splice(index, 1);
+  } else {
+    data.post_likes.push({ post_id: postId, user_id: user.id, created_at: new Date().toISOString() });
+  }
+  await saveJsonData();
+  return getPostByIdForUser(postId, user);
+}
+
+async function addPostComment(user, postId, body) {
+  const content = String(body.content ?? "").trim();
+  if (!content) return { error: "comment_required", message: "Comment cannot be empty." };
+  const existingPost = await getPostByIdForUser(postId, user);
+  if (!existingPost) return { error: "post_not_found", message: "Post was not found." };
+  if (pgPool) {
+    await pgPool.query("insert into post_comments (post_id, user_id, content) values ($1, $2, $3)", [postId, user.id, content]);
+    return { post: await getPostByIdForUser(postId, user) };
+  }
+  data.post_comments.push({ id: crypto.randomUUID(), post_id: postId, user_id: user.id, content, created_at: new Date().toISOString() });
+  await saveJsonData();
+  return { post: await getPostByIdForUser(postId, user) };
+}
+
+async function editApprovedPost(user, postId, body) {
+  const content = String(body.content ?? "").trim();
+  const mediaUrls = Array.isArray(body.media_urls) ? body.media_urls.map((item) => String(item).trim()).filter(Boolean) : [];
+  if (!content) return { error: "content_required", message: "Post content is required." };
+  const moderation = moderatePost(content);
+  if (pgPool) {
+    const result = await pgPool.query(
+      `update posts
+       set content = $3,
+           media_url = $4,
+           ai_moderation_status = $5,
+           ai_moderation_reason = $6,
+           ai_moderation_checked_at = now(),
+           published_at = case when $5 = 'approved' then coalesce(published_at, now()) else null end
+       where id = $1 and author_id = $2 and ai_moderation_status = 'approved'
+       returning id`,
+      [postId, user.id, content, mediaUrls, moderation.status, moderation.reason]
+    );
+    if (!result.rowCount) return undefined;
+    return getPostByIdForUser(postId, user);
+  }
+  const post = data.posts.find((item) => item.id === postId && item.author_id === user.id && item.ai_moderation_status === "approved");
+  if (!post) return undefined;
+  post.content = content;
+  post.media_url = mediaUrls;
+  post.ai_moderation_status = moderation.status;
+  post.status = moderation.status;
+  post.ai_moderation_reason = moderation.reason;
+  post.ai_moderation_checked_at = new Date().toISOString();
+  post.published_at = moderation.status === "approved" ? (post.published_at || new Date().toISOString()) : null;
+  await saveJsonData();
+  return getPostByIdForUser(postId, user);
+}
+
+async function getPostByIdForUser(postId, user) {
+  if (pgPool) {
+    const result = await pgPool.query(
+      `select p.id, p.author_id::text, p.content, p.media_url, p.post_type, p.parent_id, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+              coalesce(u.name, 'LearnLink user') as author,
+              count(distinct pl.user_id)::int as like_count,
+              count(distinct pc.id)::int as comment_count,
+              bool_or(pl.user_id = $2) as liked_by_me
+       from posts p
+       left join users u on u.id = p.author_id
+       left join post_likes pl on pl.post_id = p.id
+       left join post_comments pc on pc.post_id = p.id
+       where p.id = $1
+       group by p.id, u.name`,
+      [postId, user.id]
+    );
+    const posts = result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type), liked_by_me: Boolean(post.liked_by_me) }));
+    return (await hydratePostComments(posts))[0];
+  }
+  const post = data.posts.find((item) => item.id === postId);
+  return post ? enrichJsonPost(post, user) : undefined;
 }
 
 async function createPost(user, body) {
@@ -361,7 +520,11 @@ async function createPost(user, body) {
       ...post,
       author: user.name,
       source: postTypeLabel(post.post_type),
-      status: post.ai_moderation_status
+      status: post.ai_moderation_status,
+      like_count: 0,
+      comment_count: 0,
+      liked_by_me: false,
+      comments: []
     };
   }
 
@@ -381,7 +544,7 @@ async function createPost(user, body) {
   };
   data.posts.unshift(post);
   await saveJsonData();
-  return post;
+  return enrichJsonPost(post, user);
 }
 
 function applyTargetApprovalRule(user, postType, target, moderation) {
@@ -543,13 +706,13 @@ async function listOwnerReviewPosts(user) {
     .map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
 }
 
-async function searchPlatform(query) {
+async function searchPlatform(query, user) {
   const term = String(query ?? "").trim().toLowerCase();
   if (!term) {
-    return { posts: await listPosts(), courses: await listTable("courses", "courses"), jobs: await listTable("jobs", "jobs"), communities: await listTable("communities", "communities"), channels: await listTable("channels", "channels") };
+    return { posts: await listPosts(user), courses: await listTable("courses", "courses"), jobs: await listTable("jobs", "jobs"), communities: await listTable("communities", "communities"), channels: await listTable("channels", "channels") };
   }
   const contains = (item, fields) => fields.some((field) => String(item[field] ?? "").toLowerCase().includes(term));
-  const posts = (await listPosts()).filter((post) => contains(post, ["author", "source", "content", "post_type"]));
+  const posts = (await listPosts(user)).filter((post) => contains(post, ["author", "source", "content", "post_type"]));
   const courses = (await listTable("courses", "courses")).filter((item) => contains(item, ["title", "description", "category"]));
   const jobs = (await listTable("jobs", "jobs")).filter((item) => contains(item, ["title", "company", "description", "location", "category"]));
   const communities = (await listTable("communities", "communities")).filter((item) => contains(item, ["name", "description"]));
@@ -670,7 +833,7 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
   if (req.method === "GET" && req.url?.startsWith("/feed/")) {
     const user = await requireAuth(req, res);
     if (!user) return;
-    json(res, 200, { posts: await listPosts() });
+    json(res, 200, { posts: await listPosts(user) });
     return;
   }
 
@@ -715,6 +878,33 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     json(res, 200, { posts: await listOwnerReviewPosts(user) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/posts/") && req.url.endsWith("/like")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[2];
+    const post = await togglePostLike(user, postId);
+    json(res, post ? 200 : 404, post ? { post } : { error: "post_not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/posts/") && req.url.endsWith("/comments")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[2];
+    const result = await addPostComment(user, postId, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/posts/") && req.url.endsWith("/edit")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[2];
+    const result = await editApprovedPost(user, postId, await readJson(req));
+    json(res, result ? 200 : 404, result ? { post: result } : { error: "approved_post_not_found_or_not_owner" });
     return;
   }
 
@@ -779,7 +969,7 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
   if (req.method === "GET" && req.url?.startsWith("/community/feed/")) {
     const user = await requireAuth(req, res);
     if (!user) return;
-    json(res, 200, { posts: await listPosts() });
+    json(res, 200, { posts: await listPosts(user) });
     return;
   }
 
@@ -810,6 +1000,33 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     json(res, 200, { posts: await listOwnerReviewPosts(user) });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/community/posts/") && req.url.endsWith("/like")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[3];
+    const post = await togglePostLike(user, postId);
+    json(res, post ? 200 : 404, post ? { post } : { error: "post_not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/community/posts/") && req.url.endsWith("/comments")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[3];
+    const result = await addPostComment(user, postId, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/community/posts/") && req.url.endsWith("/edit")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const postId = req.url.split("/")[3];
+    const result = await editApprovedPost(user, postId, await readJson(req));
+    json(res, result ? 200 : 404, result ? { post: result } : { error: "approved_post_not_found_or_not_owner" });
     return;
   }
 
@@ -885,7 +1102,7 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     const url = requestUrl(req);
-    json(res, 200, await searchPlatform(url.searchParams.get("q")));
+    json(res, 200, await searchPlatform(url.searchParams.get("q"), user));
     return;
   }
 
