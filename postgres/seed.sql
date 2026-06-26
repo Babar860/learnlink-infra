@@ -5,9 +5,9 @@ INSERT INTO feature_flags (key, value, description) VALUES
   ('FF_CHANNEL_CREATION_AUTO', true, 'Auto-grant channel eligibility')
 ON CONFLICT (key) DO UPDATE SET value = excluded.value, description = excluded.description, updated_at = now();
 
-INSERT INTO users (id, email, name, roles, onboarding_answers, activity_score, channel_creation_eligible)
+INSERT INTO users (id, email, name, password_hash, roles, onboarding_answers, activity_score, channel_creation_eligible)
 VALUES
-  ('00000000-0000-0000-0000-000000000001', 'system@learnlink.local', 'LearnLink System', ARRAY['admin'], '{}'::jsonb, 1.000, true)
+  ('00000000-0000-0000-0000-000000000001', 'system@learnlink.local', 'LearnLink System', null, ARRAY['admin'], '{}'::jsonb, 1.000, true)
 ON CONFLICT (email) DO NOTHING;
 
 INSERT INTO communities (id, name, description, owner_id, subscriber_count)

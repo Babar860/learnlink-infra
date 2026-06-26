@@ -1,4 +1,5 @@
 .env
+.env.local
 *.log
 *.local
 local-dev-data.json

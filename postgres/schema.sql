@@ -4,6 +4,7 @@ CREATE TABLE users (
   id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email TEXT UNIQUE NOT NULL,
   name TEXT NOT NULL,
+  password_hash TEXT,
   roles TEXT[] NOT NULL DEFAULT ARRAY['student'],
   bio TEXT,
   avatar TEXT,

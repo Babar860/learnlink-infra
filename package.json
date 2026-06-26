@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "db:apply": "node scripts/apply-schema.mjs",
     "dev:local": "node local-dev-stack.mjs"
   },
   "dependencies": {
     "pg": "^8.13.1"
   }
 }
-

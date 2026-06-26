@@ -1,13 +1,61 @@
 import fs from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const workspaceRoot = path.resolve(__dirname, "..");
 const dataFile = path.join(__dirname, "local-dev-data.json");
 
+async function loadEnvFile(filePath) {
+  try {
+    const content = await fs.readFile(filePath, "utf8");
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const separatorIndex = trimmed.indexOf("=");
+      if (separatorIndex < 1) continue;
+      const key = trimmed.slice(0, separatorIndex).trim();
+      let value = trimmed.slice(separatorIndex + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (!process.env[key]) process.env[key] = value;
+    }
+  } catch {
+    // Local env files are optional; CI and hosted services can inject variables directly.
+  }
+}
+
+await loadEnvFile(path.join(workspaceRoot, ".env"));
+await loadEnvFile(path.join(__dirname, ".env"));
+
+process.env.MUX_TOKEN_ID ??= process.env.MUX_Token_Id;
+process.env.MUX_TOKEN_SECRET ??= process.env.MUX_Secret_Key;
+
+const hashPassword = (password) => createHash("sha256").update(String(password)).digest("hex");
+const publicUser = (user) => {
+  if (!user) return user;
+  const { password_hash: _passwordHash, ...safeUser } = user;
+  return safeUser;
+};
+
+const adminSeed = {
+  email: (process.env.ADMIN_EMAIL || "admin@learnlink.local").toLowerCase(),
+  name: process.env.ADMIN_NAME || "LearnLink Admin",
+  roles: ["admin"],
+  password_hash: hashPassword(process.env.ADMIN_PASSWORD || "learnlink_admin_123")
+};
+
 const seedData = {
-  users: [],
+  users: [
+    {
+      id: "local-admin",
+      ...adminSeed,
+      created_at: new Date().toISOString()
+    }
+  ],
   sessions: [],
   posts: [
     {
@@ -89,6 +137,7 @@ async function saveJsonData() {
 async function initStorage() {
   pgPool = await loadPgPool();
   data = pgPool ? structuredClone(seedData) : await loadJsonData();
+  await ensureAdminUser();
 }
 
 const json = (res, status, body) => {
@@ -123,6 +172,14 @@ async function getUserBySession(token) {
   return session ? data.users.find((user) => user.id === session.user_id) : undefined;
 }
 
+async function getUserByEmail(email) {
+  if (pgPool) {
+    const result = await pgPool.query("select id, email, name, roles, password_hash, created_at from users where lower(email) = lower($1)", [email]);
+    return result.rows[0];
+  }
+  return data.users.find((user) => user.email.toLowerCase() === email.toLowerCase());
+}
+
 async function requireAuth(req, res) {
   const header = req.headers.authorization ?? "";
   const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
@@ -134,14 +191,18 @@ async function requireAuth(req, res) {
   return user;
 }
 
-async function upsertUser({ email, name, roles }) {
+async function upsertUser({ email, name, roles, password }) {
+  const passwordHash = password ? hashPassword(password) : null;
   if (pgPool) {
     const result = await pgPool.query(
-      `insert into users (email, name, roles)
-       values ($1, $2, $3)
-       on conflict (email) do update set name = excluded.name, roles = excluded.roles
+      `insert into users (email, name, roles, password_hash)
+       values ($1, $2, $3, $4)
+       on conflict (email) do update
+       set name = excluded.name,
+           roles = excluded.roles,
+           password_hash = coalesce(excluded.password_hash, users.password_hash)
        returning id, email, name, roles, created_at`,
-      [email, name, roles]
+      [email, name, roles, passwordHash]
     );
     return result.rows[0];
   }
@@ -150,14 +211,40 @@ async function upsertUser({ email, name, roles }) {
   if (existing) {
     existing.name = name || existing.name;
     existing.roles = roles;
+    if (passwordHash) existing.password_hash = passwordHash;
     await saveJsonData();
     return existing;
   }
 
-  const user = { id: crypto.randomUUID(), email, name, roles, created_at: new Date().toISOString() };
+  const user = { id: crypto.randomUUID(), email, name, roles, password_hash: passwordHash, created_at: new Date().toISOString() };
   data.users.push(user);
   await saveJsonData();
   return user;
+}
+
+async function ensureAdminUser() {
+  if (pgPool) {
+    await pgPool.query(
+      `insert into users (email, name, roles, password_hash)
+       values ($1, $2, $3, $4)
+       on conflict (email) do update
+       set name = excluded.name,
+           roles = excluded.roles,
+           password_hash = excluded.password_hash`,
+      [adminSeed.email, adminSeed.name, adminSeed.roles, adminSeed.password_hash]
+    );
+    return;
+  }
+
+  const existing = data.users.find((user) => user.email.toLowerCase() === adminSeed.email);
+  if (existing) {
+    existing.name = adminSeed.name;
+    existing.roles = adminSeed.roles;
+    existing.password_hash = adminSeed.password_hash;
+  } else {
+    data.users.push({ id: "local-admin", ...adminSeed, created_at: new Date().toISOString() });
+  }
+  await saveJsonData();
 }
 
 async function createSession(user) {
@@ -262,7 +349,8 @@ function createServer(port, serviceName, handler) {
         json(res, 200, {
           ok: true,
           service: serviceName,
-          persistence: pgPool ? "postgresql" : "local-json"
+          persistence: pgPool ? "postgresql" : "local-json",
+          integrations: integrationStatus()
         });
         return;
       }
@@ -279,32 +367,60 @@ function createServer(port, serviceName, handler) {
 }
 
 const handleAuth = async (req, res) => {
-  if (req.method === "POST" && (req.url === "/auth/signup" || req.url === "/auth/login")) {
+  if (req.method === "POST" && req.url === "/auth/signup") {
     const body = await readJson(req);
     const email = String(body.email ?? "").trim().toLowerCase();
     const name = String(body.name ?? email.split("@")[0] ?? "Local user").trim();
+    const password = String(body.password ?? "");
     const roles = body.roles?.length ? body.roles : ["student"];
 
-    if (!email || !name) {
-      json(res, 400, { error: "name_and_email_required" });
+    if (!email || !name || password.length < 8) {
+      json(res, 400, { error: "name_email_and_8_char_password_required" });
       return true;
     }
 
-    const user = await upsertUser({ email, name, roles });
+    const user = await upsertUser({ email, name, roles, password });
     const token = await createSession(user);
-    json(res, req.url.endsWith("signup") ? 201 : 200, { user, token });
+    json(res, 201, { user: publicUser(user), token });
+    return true;
+  }
+
+  if (req.method === "POST" && req.url === "/auth/login") {
+    const body = await readJson(req);
+    const email = String(body.email ?? "").trim().toLowerCase();
+    const password = String(body.password ?? "");
+    const user = email ? await getUserByEmail(email) : undefined;
+
+    if (!user || user.password_hash !== hashPassword(password)) {
+      json(res, 401, { error: "invalid_email_or_password" });
+      return true;
+    }
+
+    const token = await createSession(user);
+    json(res, 200, { user: publicUser(user), token });
     return true;
   }
 
   if (req.method === "GET" && req.url === "/auth/me") {
     const user = await requireAuth(req, res);
     if (!user) return true;
-    json(res, 200, { user });
+    json(res, 200, { user: publicUser(user) });
     return true;
   }
 
   return false;
 };
+
+function integrationStatus() {
+  return {
+    database: pgPool ? "postgresql" : "local-json",
+    gemini: Boolean(process.env.GEMINI_API_KEY),
+    smtp: Boolean(process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASSWORD),
+    mux: Boolean(process.env.MUX_TOKEN_ID && process.env.MUX_TOKEN_SECRET),
+    firebase: Boolean(process.env.FIREBASE_PROJECT_ID || process.env.FIREBASE_WEB_PUSH_KEY),
+    googleCloudProject: process.env.GOOGLE_CLOUD_PROJECT || null
+  };
+}
 
 await initStorage();
 
@@ -409,7 +525,8 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     json(res, 200, {
       ...(await listAdminLogs()),
       feature_flags: data.feature_flags,
-      persistence: pgPool ? "postgresql" : "local-json"
+      persistence: pgPool ? "postgresql" : "local-json",
+      integrations: integrationStatus()
     });
     return;
   }
