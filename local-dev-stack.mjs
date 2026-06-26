@@ -62,12 +62,13 @@ const seedData = {
       id: "local-post-1",
       author_id: "system",
       author: "Local Backend",
-      source: "Community API",
+      source: "Platform update",
       status: "approved",
       content: "This post is persisted by the LearnLink local API layer.",
-      metrics: "Served through gateway on localhost:4000",
+      media_url: [],
       ai_moderation_status: "approved",
       post_type: "platform_post",
+      ai_moderation_reason: "Seed post approved by the local moderation agent.",
       created_at: new Date().toISOString()
     }
   ],
@@ -158,6 +159,40 @@ const readJson = async (req) => {
   if (!chunks.length) return {};
   return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 };
+
+const requestUrl = (req) => new URL(req.url ?? "/", "http://localhost");
+
+function normalizePostType(value) {
+  return ["community_post", "channel_post", "platform_post"].includes(value) ? value : "platform_post";
+}
+
+function postTypeLabel(postType) {
+  if (postType === "community_post") return "Community post";
+  if (postType === "channel_post") return "Channel post";
+  return "Platform post";
+}
+
+function moderatePost(content) {
+  const text = content.toLowerCase();
+  const rejectedPatterns = [
+    { pattern: "spam", reason: "Rejected because the post looks like spam or repeated promotional content." },
+    { pattern: "scam", reason: "Rejected because the post appears to promote a scam or unsafe opportunity." },
+    { pattern: "hate", reason: "Rejected because the post may contain hateful or abusive language." },
+    { pattern: "violence", reason: "Rejected because the post may encourage violence or harm." }
+  ];
+  const rejected = rejectedPatterns.find((item) => text.includes(item.pattern));
+  if (rejected) {
+    return { status: "rejected", reason: rejected.reason, publishedAt: null };
+  }
+  if (text.includes("needs review") || text.includes("pending review")) {
+    return {
+      status: "pending",
+      reason: "Queued for a deeper agent review because the post requested manual-style review.",
+      publishedAt: null
+    };
+  }
+  return { status: "approved", reason: "Approved by the local AI moderation agent.", publishedAt: new Date().toISOString() };
+}
 
 async function getUserBySession(token) {
   if (!token) return undefined;
@@ -262,39 +297,60 @@ async function createSession(user) {
 async function listPosts() {
   if (pgPool) {
     const result = await pgPool.query(
-      `select p.id, p.content, p.post_type, p.ai_moderation_status, p.created_at,
+      `select p.id, p.content, p.media_url, p.post_type, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
               coalesce(u.name, 'LearnLink user') as author,
-              p.post_type as source,
-              'Persisted in PostgreSQL' as metrics
+              p.post_type as source
        from posts p
        left join users u on u.id = p.author_id
        where p.ai_moderation_status = 'approved'
        order by p.created_at desc
        limit 50`
     );
-    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status }));
+    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type) }));
   }
-  return data.posts;
+  return data.posts.filter((post) => post.ai_moderation_status === "approved").map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
+}
+
+async function listMyPosts(user) {
+  if (pgPool) {
+    const result = await pgPool.query(
+      `select p.id, p.content, p.media_url, p.post_type, p.ai_moderation_status, p.ai_moderation_reason, p.created_at,
+              coalesce(u.name, 'LearnLink user') as author,
+              p.post_type as source
+       from posts p
+       left join users u on u.id = p.author_id
+       where p.author_id = $1
+       order by p.created_at desc
+       limit 100`,
+      [user.id]
+    );
+    return result.rows.map((post) => ({ ...post, status: post.ai_moderation_status, source: postTypeLabel(post.post_type) }));
+  }
+  return data.posts
+    .filter((post) => post.author_id === user.id)
+    .map((post) => ({ ...post, source: post.source || postTypeLabel(post.post_type) }));
 }
 
 async function createPost(user, body) {
   const content = String(body.content ?? "").trim();
   if (!content) return undefined;
+  const postType = normalizePostType(body.post_type);
+  const mediaUrls = Array.isArray(body.media_urls) ? body.media_urls.map((item) => String(item).trim()).filter(Boolean) : [];
+  const moderation = moderatePost(content);
 
   if (pgPool) {
     const result = await pgPool.query(
-      `insert into posts (content, author_id, post_type, ai_moderation_status, ai_moderation_reason, ai_moderation_checked_at, published_at)
-       values ($1, $2, $3, 'approved', 'Local development moderation approved.', now(), now())
-       returning id, content, post_type, ai_moderation_status, created_at`,
-      [content, user.id, body.post_type ?? "platform_post"]
+      `insert into posts (content, media_url, author_id, post_type, ai_moderation_status, ai_moderation_reason, ai_moderation_checked_at, published_at)
+       values ($1, $2, $3, $4, $5, $6, now(), $7)
+       returning id, content, media_url, post_type, ai_moderation_status, ai_moderation_reason, created_at`,
+      [content, mediaUrls, user.id, postType, moderation.status, moderation.reason, moderation.publishedAt]
     );
     const post = result.rows[0];
     return {
       ...post,
       author: user.name,
-      source: post.post_type,
-      status: post.ai_moderation_status,
-      metrics: "Persisted in PostgreSQL"
+      source: postTypeLabel(post.post_type),
+      status: post.ai_moderation_status
     };
   }
 
@@ -302,17 +358,32 @@ async function createPost(user, body) {
     id: crypto.randomUUID(),
     author_id: user.id,
     author: user.name,
-    source: body.post_type ?? "platform_post",
-    status: "approved",
+    source: postTypeLabel(postType),
+    status: moderation.status,
     content,
-    metrics: "Persisted in local storage",
-    ai_moderation_status: "approved",
-    post_type: body.post_type ?? "platform_post",
+    media_url: mediaUrls,
+    ai_moderation_status: moderation.status,
+    ai_moderation_reason: moderation.reason,
+    post_type: postType,
     created_at: new Date().toISOString()
   };
   data.posts.unshift(post);
   await saveJsonData();
   return post;
+}
+
+async function searchPlatform(query) {
+  const term = String(query ?? "").trim().toLowerCase();
+  if (!term) {
+    return { posts: await listPosts(), courses: await listTable("courses", "courses"), jobs: await listTable("jobs", "jobs"), communities: await listTable("communities", "communities"), channels: await listTable("channels", "channels") };
+  }
+  const contains = (item, fields) => fields.some((field) => String(item[field] ?? "").toLowerCase().includes(term));
+  const posts = (await listPosts()).filter((post) => contains(post, ["author", "source", "content", "post_type"]));
+  const courses = (await listTable("courses", "courses")).filter((item) => contains(item, ["title", "description", "category"]));
+  const jobs = (await listTable("jobs", "jobs")).filter((item) => contains(item, ["title", "company", "description", "location", "category"]));
+  const communities = (await listTable("communities", "communities")).filter((item) => contains(item, ["name", "description"]));
+  const channels = (await listTable("channels", "channels")).filter((item) => contains(item, ["name", "description"]));
+  return { posts, courses, jobs, communities, channels };
 }
 
 async function listTable(tableName, fallbackKey) {
@@ -454,6 +525,13 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/posts/mine") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { posts: await listMyPosts(user) });
+    return;
+  }
+
   json(res, 404, { error: "not_found" });
 });
 
@@ -487,6 +565,13 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url === "/community/posts/mine") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { posts: await listMyPosts(user) });
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/community/communities") {
     const user = await requireAuth(req, res);
     if (!user) return;
@@ -512,6 +597,14 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     json(res, 200, { jobs: await listTable("jobs", "jobs") });
+    return;
+  }
+
+  if (req.method === "GET" && req.url?.startsWith("/search")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const url = requestUrl(req);
+    json(res, 200, await searchPlatform(url.searchParams.get("q")));
     return;
   }
 
