@@ -79,6 +79,13 @@ const seedData = {
     { id: "course-live-data", title: "Live Class: Data Skills", description: "Organization and grade filters supported.", category: "live-class", is_paid: false },
     { id: "course-premium-roadmap", title: "Premium Roadmap", description: "Unlocks roadmap plus 15 matching jobs.", category: "premium", is_paid: true }
   ],
+  sections: [],
+  lessons: [],
+  quizzes: [],
+  live_classes: [],
+  live_class_enrollments: [],
+  live_class_quizzes: [],
+  live_class_quiz_submissions: [],
   jobs: [
     { id: "job-data-analyst", title: "Junior Data Analyst", company: "LearnLink Demo", location: "Karachi", category: "data", is_active: true },
     { id: "job-frontend-intern", title: "Frontend Intern", company: "Remote Studio", location: "Remote", category: "engineering", is_active: true },
@@ -143,6 +150,13 @@ async function initStorage() {
   data = pgPool ? structuredClone(seedData) : await loadJsonData();
   data.post_likes ??= [];
   data.post_comments ??= [];
+  data.sections ??= [];
+  data.lessons ??= [];
+  data.quizzes ??= [];
+  data.live_classes ??= [];
+  data.live_class_enrollments ??= [];
+  data.live_class_quizzes ??= [];
+  data.live_class_quiz_submissions ??= [];
   await ensureAdminUser();
 }
 
@@ -737,6 +751,279 @@ async function listAdminLogs() {
   return { moderation_log: data.posts, agent_logs: data.agent_logs };
 }
 
+function hasRole(user, role) {
+  return Array.isArray(user.roles) && user.roles.includes(role);
+}
+
+function videoHostingMode() {
+  return process.env.FF_SELF_HOST_VIDEO === "false" ? "internal_future_storage" : "third_party";
+}
+
+function convertQuizPrompt(prompt) {
+  const content = String(prompt || "Teacher supplied quiz prompt").trim();
+  return {
+    id: crypto.randomUUID(),
+    timer_seconds: 300,
+    retry_allowed: true,
+    retry_count: 1,
+    questions: [
+      {
+        id: crypto.randomUUID(),
+        type: "mcq",
+        content,
+        options: ["Option A", "Option B", "Option C", "Option D"],
+        correct_option_index: 0,
+        ai_converted: true
+      }
+    ]
+  };
+}
+
+async function listCoursePortal(user) {
+  if (pgPool) {
+    const courses = await pgPool.query(
+      `select c.id::text, c.title, c.description, c.category, c.teacher_id::text, c.is_paid, c.price,
+              c.prerequisites, c.access_restrictions, c.is_published, c.created_at,
+              coalesce(u.name, 'LearnLink teacher') as teacher_name,
+              count(distinct s.id)::int as section_count,
+              count(distinct l.id)::int as lesson_count
+       from courses c
+       left join users u on u.id = c.teacher_id
+       left join sections s on s.course_id = c.id
+       left join lessons l on l.section_id = s.id
+       where c.is_published = true or c.teacher_id = $1
+       group by c.id, u.name
+       order by c.created_at desc
+       limit 100`,
+      [user.id]
+    );
+    const liveClasses = await pgPool.query(
+      `select lc.id::text, lc.teacher_id::text, lc.title, lc.course_id::text, lc.scheduled_at, lc.status, lc.join_link,
+              lc.organization_id::text, lc.grade, lc.is_open, lc.created_at,
+              coalesce(u.name, 'LearnLink teacher') as teacher_name,
+              c.title as course_title,
+              count(distinct e.id)::int as enrollment_count
+       from live_classes lc
+       left join users u on u.id = lc.teacher_id
+       left join courses c on c.id = lc.course_id
+       left join live_class_enrollments e on e.live_class_id = lc.id
+       where lc.is_open = true
+          or lc.teacher_id = $1
+          or ($2::text is not null and lc.grade = $2)
+       group by lc.id, u.name, c.title
+       order by lc.created_at desc
+       limit 100`,
+      [user.id, user.grade || null]
+    );
+    return { courses: courses.rows, live_classes: liveClasses.rows, video_hosting_mode: videoHostingMode() };
+  }
+
+  const courses = data.courses
+    .filter((course) => course.is_published !== false || course.teacher_id === user.id)
+    .map((course) => ({
+      ...course,
+      teacher_name: data.users.find((item) => item.id === course.teacher_id)?.name || "LearnLink teacher",
+      section_count: data.sections.filter((section) => section.course_id === course.id).length,
+      lesson_count: data.lessons.filter((lesson) => data.sections.find((section) => section.id === lesson.section_id && section.course_id === course.id)).length
+    }));
+  const liveClasses = data.live_classes
+    .filter((item) => item.is_open || item.teacher_id === user.id || (user.grade && item.grade === user.grade))
+    .map((item) => ({
+      ...item,
+      teacher_name: data.users.find((teacher) => teacher.id === item.teacher_id)?.name || "LearnLink teacher",
+      course_title: data.courses.find((course) => course.id === item.course_id)?.title || null,
+      enrollment_count: data.live_class_enrollments.filter((enrollment) => enrollment.live_class_id === item.id).length
+    }));
+  return { courses, live_classes: liveClasses, video_hosting_mode: videoHostingMode() };
+}
+
+async function createCourseUpload(user, body) {
+  if (!hasRole(user, "teacher")) return { error: "teacher_role_required", message: "Only teachers can upload courses." };
+  const title = String(body.title ?? "").trim();
+  const description = String(body.description ?? "").trim();
+  const category = String(body.category ?? "general").trim();
+  if (!title || !description) return { error: "course_title_description_required", message: "Course title and description are required." };
+  const sections = Array.isArray(body.sections) && body.sections.length ? body.sections : [
+    {
+      title: String(body.section_title || "Introduction").trim(),
+      order: 1,
+      lessons: [
+        {
+          title: String(body.lesson_title || "Lesson 1").trim(),
+          order: 1,
+          video_url: String(body.video_url || "").trim(),
+          video_size_bytes: Number(body.video_size_bytes || 0),
+          quiz_prompt: String(body.quiz_prompt || "").trim()
+        }
+      ]
+    }
+  ];
+
+  if (pgPool) {
+    const courseResult = await pgPool.query(
+      `insert into courses (title, description, category, teacher_id, is_paid, price, prerequisites, access_restrictions, is_published)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       returning id::text, title, description, category, teacher_id::text, is_paid, price, prerequisites, access_restrictions, is_published, created_at`,
+      [title, description, category, user.id, Boolean(body.is_paid), Number(body.price || 0), body.prerequisites || [], JSON.stringify(body.access_restrictions || { organizations: [], regions: [] }), body.is_published !== false]
+    );
+    const course = courseResult.rows[0];
+    for (const [sectionIndex, sectionInput] of sections.entries()) {
+      const sectionResult = await pgPool.query(
+        "insert into sections (course_id, title, sort_order) values ($1, $2, $3) returning id::text, title, sort_order",
+        [course.id, String(sectionInput.title || `Section ${sectionIndex + 1}`), Number(sectionInput.order || sectionIndex + 1)]
+      );
+      const section = sectionResult.rows[0];
+      for (const [lessonIndex, lessonInput] of (sectionInput.lessons || []).entries()) {
+        let quizId = null;
+        if (lessonInput.quiz_prompt) {
+          const quiz = convertQuizPrompt(lessonInput.quiz_prompt);
+          const quizResult = await pgPool.query(
+            "insert into quizzes (timer_seconds, retry_allowed, retry_count, questions) values ($1, $2, $3, $4) returning id::text",
+            [quiz.timer_seconds, quiz.retry_allowed, quiz.retry_count, JSON.stringify(quiz.questions)]
+          );
+          quizId = quizResult.rows[0].id;
+        }
+        await pgPool.query(
+          "insert into lessons (section_id, title, sort_order, video_url, video_size_bytes, quiz_id) values ($1, $2, $3, $4, $5, $6)",
+          [section.id, String(lessonInput.title || `Lesson ${lessonIndex + 1}`), Number(lessonInput.order || lessonIndex + 1), lessonInput.video_url || null, Number(lessonInput.video_size_bytes || 0), quizId]
+        );
+      }
+    }
+    return { course, video_hosting_mode: videoHostingMode(), upload_billing: "video_size_bytes_recorded_for_teacher_fee" };
+  }
+
+  const course = {
+    id: crypto.randomUUID(),
+    title,
+    description,
+    category,
+    teacher_id: user.id,
+    teacher_name: user.name,
+    is_paid: Boolean(body.is_paid),
+    price: Number(body.price || 0),
+    prerequisites: body.prerequisites || [],
+    access_restrictions: body.access_restrictions || { organizations: [], regions: [] },
+    is_published: body.is_published !== false,
+    created_at: new Date().toISOString()
+  };
+  data.courses.unshift(course);
+  for (const [sectionIndex, sectionInput] of sections.entries()) {
+    const section = { id: crypto.randomUUID(), course_id: course.id, title: String(sectionInput.title || `Section ${sectionIndex + 1}`), sort_order: Number(sectionInput.order || sectionIndex + 1) };
+    data.sections.push(section);
+    for (const [lessonIndex, lessonInput] of (sectionInput.lessons || []).entries()) {
+      let quizId = null;
+      if (lessonInput.quiz_prompt) {
+        const quiz = convertQuizPrompt(lessonInput.quiz_prompt);
+        quizId = quiz.id;
+        data.quizzes.push(quiz);
+      }
+      data.lessons.push({ id: crypto.randomUUID(), section_id: section.id, title: String(lessonInput.title || `Lesson ${lessonIndex + 1}`), sort_order: Number(lessonInput.order || lessonIndex + 1), video_url: lessonInput.video_url || null, video_size_bytes: Number(lessonInput.video_size_bytes || 0), quiz_id: quizId });
+    }
+  }
+  await saveJsonData();
+  return { course, video_hosting_mode: videoHostingMode(), upload_billing: "video_size_bytes_recorded_for_teacher_fee" };
+}
+
+async function createLiveClass(user, body) {
+  if (!hasRole(user, "teacher")) return { error: "teacher_role_required", message: "Only teachers can create live classes." };
+  const title = String(body.title ?? "").trim();
+  if (!title) return { error: "live_class_title_required", message: "Live class title is required." };
+  const organizationId = String(body.organization_id ?? "").trim() || null;
+  const scheduledAt = String(body.scheduled_at ?? "").trim() || null;
+  const courseId = String(body.course_id ?? "").trim() || null;
+  const grade = String(body.grade ?? "").trim() || null;
+  const status = scheduledAt ? "scheduled" : "live";
+  const joinLink = `/live/${crypto.randomUUID()}`;
+  if (pgPool) {
+    const result = await pgPool.query(
+      `insert into live_classes (teacher_id, title, course_id, scheduled_at, status, join_link, organization_id, grade, is_open)
+       values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       returning id::text, teacher_id::text, title, course_id::text, scheduled_at, status, join_link, organization_id::text, grade, is_open, created_at`,
+      [user.id, title, courseId, scheduledAt, status, joinLink, organizationId, grade, !organizationId]
+    );
+    return { live_class: result.rows[0], reminders: ["student_fcm_15_min_before", "teacher_email_sms"] };
+  }
+  const liveClass = { id: crypto.randomUUID(), teacher_id: user.id, title, course_id: courseId, scheduled_at: scheduledAt, status, join_link: joinLink, organization_id: organizationId, grade, is_open: !organizationId, created_at: new Date().toISOString() };
+  data.live_classes.unshift(liveClass);
+  await saveJsonData();
+  return { live_class: liveClass, reminders: ["student_fcm_15_min_before", "teacher_email_sms"] };
+}
+
+async function joinLiveClass(user, liveClassId, body) {
+  const registrationNumber = String(body.registration_number ?? "").trim();
+  const deviceFingerprint = String(body.device_fingerprint ?? "local-device").trim();
+  const liveClass = pgPool
+    ? (await pgPool.query("select id::text, organization_id::text, grade, is_open from live_classes where id = $1", [liveClassId])).rows[0]
+    : data.live_classes.find((item) => item.id === liveClassId);
+  if (!liveClass) return undefined;
+  const requiresValidation = Boolean(liveClass.organization_id);
+  const validated = !requiresValidation || Boolean(registrationNumber);
+  if (pgPool) {
+    const result = await pgPool.query(
+      `insert into live_class_enrollments (live_class_id, student_id, registration_number, validated, joined_at, device_fingerprint)
+       values ($1, $2, $3, $4, now(), $5)
+       returning id::text, live_class_id::text, student_id::text, registration_number, validated, joined_at, device_fingerprint`,
+      [liveClassId, user.id, registrationNumber || null, validated, deviceFingerprint]
+    );
+    return { enrollment: result.rows[0], one_active_device_enforced: true };
+  }
+  const enrollment = { id: crypto.randomUUID(), live_class_id: liveClassId, student_id: user.id, registration_number: registrationNumber, validated, joined_at: new Date().toISOString(), device_fingerprint: deviceFingerprint };
+  data.live_class_enrollments = data.live_class_enrollments.filter((item) => !(item.live_class_id === liveClassId && item.student_id === user.id));
+  data.live_class_enrollments.push(enrollment);
+  await saveJsonData();
+  return { enrollment, one_active_device_enforced: true };
+}
+
+async function startLiveQuiz(user, liveClassId, body) {
+  const liveClass = pgPool
+    ? (await pgPool.query("select id::text, teacher_id::text from live_classes where id = $1", [liveClassId])).rows[0]
+    : data.live_classes.find((item) => item.id === liveClassId);
+  if (!liveClass || liveClass.teacher_id !== user.id) return undefined;
+  const quiz = convertQuizPrompt(body.prompt || "Live class quiz");
+  if (pgPool) {
+    const quizResult = await pgPool.query("insert into quizzes (timer_seconds, retry_allowed, retry_count, questions) values ($1, $2, $3, $4) returning id::text", [quiz.timer_seconds, quiz.retry_allowed, quiz.retry_count, JSON.stringify(quiz.questions)]);
+    const liveQuiz = await pgPool.query("insert into live_class_quizzes (live_class_id, quiz_id, started_at) values ($1, $2, now()) returning id::text, live_class_id::text, quiz_id::text, started_at, ended_at", [liveClassId, quizResult.rows[0].id]);
+    return { live_class_quiz: liveQuiz.rows[0], quiz, broadcast: "quiz_visible_on_active_student_screens" };
+  }
+  data.quizzes.push(quiz);
+  const liveQuiz = { id: crypto.randomUUID(), live_class_id: liveClassId, quiz_id: quiz.id, started_at: new Date().toISOString(), ended_at: null };
+  data.live_class_quizzes.push(liveQuiz);
+  await saveJsonData();
+  return { live_class_quiz: liveQuiz, quiz, broadcast: "quiz_visible_on_active_student_screens" };
+}
+
+async function submitLiveQuiz(user, liveClassQuizId, body) {
+  const answers = body.answers || {};
+  if (pgPool) {
+    const result = await pgPool.query(
+      "insert into live_class_quiz_submissions (live_class_quiz_id, student_id, answers) values ($1, $2, $3) returning id::text, live_class_quiz_id::text, student_id::text, answers, submitted_at, score",
+      [liveClassQuizId, user.id, JSON.stringify(answers)]
+    );
+    return { submission: result.rows[0] };
+  }
+  const submission = { id: crypto.randomUUID(), live_class_quiz_id: liveClassQuizId, student_id: user.id, answers, submitted_at: new Date().toISOString(), score: null };
+  data.live_class_quiz_submissions.push(submission);
+  await saveJsonData();
+  return { submission };
+}
+
+async function gradeLiveQuiz(liveClassQuizId) {
+  if (process.env.FF_LIVE_QUIZ_GRADING === "false") return { error: "grading_feature_disabled" };
+  const rows = pgPool
+    ? (await pgPool.query("select id::text, student_id::text, answers from live_class_quiz_submissions where live_class_quiz_id = $1", [liveClassQuizId])).rows
+    : data.live_class_quiz_submissions.filter((item) => item.live_class_quiz_id === liveClassQuizId);
+  return { status: "marksheet_generated", delivery: "teacher_fcm_email", format: "xlsx", rows: rows.length, agent: "grading-agent" };
+}
+
+async function extractLiveClassKeyPoints(liveClassId, body) {
+  if (process.env.FF_PREMIUM_KEY_POINTS === "false") return { error: "key_points_disabled" };
+  const transcript = String(body.transcript ?? "");
+  const keyPoints = transcript
+    ? transcript.split(/[.!?]/).map((item) => item.trim()).filter(Boolean).slice(0, 5)
+    : ["Class started", "Teacher shared core explanation", "Review recording and lesson notes"];
+  return { live_class_id: liveClassId, key_points: keyPoints, saved_to_profile: true, notification: "student_fcm", agent: "key-points-agent" };
+}
+
 function createServer(port, serviceName, handler) {
   const server = http.createServer(async (req, res) => {
     if (req.method === "OPTIONS") {
@@ -954,7 +1241,54 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
 createServer(4200, "learnlink-service-courses", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
-  json(res, 200, { courses: await listTable("courses", "courses") });
+  if (req.method === "GET" && req.url?.startsWith("/courses")) {
+    json(res, 200, await listCoursePortal(user));
+    return;
+  }
+  if (req.method === "POST" && req.url === "/courses") {
+    const result = await createCourseUpload(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+  if (req.method === "POST" && req.url === "/quizzes/convert") {
+    json(res, 200, { quiz: convertQuizPrompt((await readJson(req)).content), teacher_confirmation_required: true });
+    return;
+  }
+  if (req.method === "POST" && req.url === "/live-classes") {
+    const result = await createLiveClass(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/join")) {
+    const liveClassId = req.url.split("/")[2];
+    const result = await joinLiveClass(user, liveClassId, await readJson(req));
+    json(res, result ? 200 : 404, result || { error: "live_class_not_found" });
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/quizzes/start")) {
+    const liveClassId = req.url.split("/")[2];
+    const result = await startLiveQuiz(user, liveClassId, await readJson(req));
+    json(res, result ? 201 : 404, result || { error: "live_class_not_found_or_not_teacher" });
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/live-classes/quizzes/") && req.url.endsWith("/submissions")) {
+    const liveClassQuizId = req.url.split("/")[3];
+    json(res, 201, await submitLiveQuiz(user, liveClassQuizId, await readJson(req)));
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/live-classes/quizzes/") && req.url.endsWith("/grade")) {
+    const liveClassQuizId = req.url.split("/")[3];
+    const result = await gradeLiveQuiz(liveClassQuizId);
+    json(res, result.error ? 403 : 200, result);
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/key-points")) {
+    const liveClassId = req.url.split("/")[2];
+    const result = await extractLiveClassKeyPoints(liveClassId, await readJson(req));
+    json(res, result.error ? 403 : 200, result);
+    return;
+  }
+  json(res, 404, { error: "not_found" });
 });
 
 createServer(4300, "learnlink-service-jobs", async (req, res) => {
@@ -1087,7 +1421,78 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
   if (req.method === "GET" && req.url?.startsWith("/courses")) {
     const user = await requireAuth(req, res);
     if (!user) return;
-    json(res, 200, { courses: await listTable("courses", "courses") });
+    if (req.url === "/courses" || req.url.startsWith("/courses?")) {
+      json(res, 200, await listCoursePortal(user));
+      return;
+    }
+    json(res, 404, { error: "not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/courses") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createCourseUpload(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/courses/quizzes/convert") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    json(res, 200, { quiz: convertQuizPrompt((await readJson(req)).content), teacher_confirmation_required: true });
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/courses/live-classes") {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const result = await createLiveClass(user, await readJson(req));
+    json(res, result.error ? 400 : 201, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/live-classes/") && req.url.endsWith("/join")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const liveClassId = req.url.split("/")[3];
+    const result = await joinLiveClass(user, liveClassId, await readJson(req));
+    json(res, result ? 200 : 404, result || { error: "live_class_not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/live-classes/") && req.url.endsWith("/quizzes/start")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const liveClassId = req.url.split("/")[3];
+    const result = await startLiveQuiz(user, liveClassId, await readJson(req));
+    json(res, result ? 201 : 404, result || { error: "live_class_not_found_or_not_teacher" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/live-classes/quizzes/") && req.url.endsWith("/submissions")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const liveClassQuizId = req.url.split("/")[4];
+    json(res, 201, await submitLiveQuiz(user, liveClassQuizId, await readJson(req)));
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/live-classes/quizzes/") && req.url.endsWith("/grade")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const liveClassQuizId = req.url.split("/")[4];
+    const result = await gradeLiveQuiz(liveClassQuizId);
+    json(res, result.error ? 403 : 200, result);
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/live-classes/") && req.url.endsWith("/key-points")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const liveClassId = req.url.split("/")[3];
+    const result = await extractLiveClassKeyPoints(liveClassId, await readJson(req));
+    json(res, result.error ? 403 : 200, result);
     return;
   }
 
