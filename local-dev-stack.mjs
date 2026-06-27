@@ -623,14 +623,14 @@ async function createChannel(user, body) {
   if (!name) return { error: "channel_name_required", message: "Channel name is required." };
   if (pgPool) {
     const result = await pgPool.query(
-      `insert into channels (name, description, owner_id, is_paid, price_monthly)
-       values ($1, $2, $3, $4, $5)
-       returning id::text, name, description, owner_id::text, is_paid, price_monthly, created_at`,
-      [name, description, user.id, Boolean(body.is_paid), Number(body.price_monthly || 0)]
+      `insert into channels (name, description, owner_id, is_paid, price_monthly, organization_id, grade)
+       values ($1, $2, $3, $4, $5, $6, $7)
+       returning id::text, name, description, owner_id::text, is_paid, price_monthly, organization_id::text, grade, created_at`,
+      [name, description, user.id, Boolean(body.is_paid), Number(body.price_monthly || 0), normalizeOrganizationId(body.organization_id), body.grade || null]
     );
     return { channel: result.rows[0] };
   }
-  const channel = { id: crypto.randomUUID(), name, description, owner_id: user.id, is_paid: Boolean(body.is_paid), price_monthly: Number(body.price_monthly || 0), created_at: new Date().toISOString() };
+  const channel = { id: crypto.randomUUID(), name, description, owner_id: user.id, is_paid: Boolean(body.is_paid), price_monthly: Number(body.price_monthly || 0), organization_id: normalizeOrganizationId(body.organization_id), grade: body.grade || null, created_at: new Date().toISOString() };
   data.channels.unshift(channel);
   await saveJsonData();
   return { channel };
@@ -759,6 +759,18 @@ function videoHostingMode() {
   return process.env.FF_SELF_HOST_VIDEO === "false" ? "internal_future_storage" : "third_party";
 }
 
+function normalizeOrganizationId(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(text)) return text;
+  const known = {
+    kiet: "10000000-0000-0000-0000-000000000001",
+    "karachi institute of economics and technology": "10000000-0000-0000-0000-000000000001",
+    "learnlink-demo": "10000000-0000-0000-0000-000000000002"
+  };
+  return known[text.toLowerCase()] || "10000000-0000-0000-0000-000000000099";
+}
+
 function convertQuizPrompt(prompt) {
   const content = String(prompt || "Teacher supplied quiz prompt").trim();
   return {
@@ -776,6 +788,31 @@ function convertQuizPrompt(prompt) {
         ai_converted: true
       }
     ]
+  };
+}
+
+function estimateVideoUploadFee(bytes) {
+  const gb = Number(bytes || 0) / 1024 / 1024 / 1024;
+  return Math.max(0, Math.ceil(gb * 150));
+}
+
+function courseRecommendationMode(user) {
+  if (user.resume_url) return "resume_keyword_agent";
+  if (user.completed_track) return "next_level_same_track";
+  return "trending_plus_onboarding";
+}
+
+function buildPremiumRoadmap(course) {
+  return {
+    roadmap: [
+      `Start with ${course.title}`,
+      "Complete all lessons and quizzes",
+      "Build one portfolio project",
+      "Review premium key points",
+      "Apply to matching jobs"
+    ],
+    included_paid_courses: data.courses.filter((item) => item.is_paid).slice(0, 5),
+    matching_jobs: Array.from({ length: 15 }, (_, index) => ({ id: `job-match-${index + 1}`, title: `${course.category || "career"} role ${index + 1}`, source: "LearnLink jobs" }))
   };
 }
 
@@ -815,7 +852,7 @@ async function listCoursePortal(user) {
        limit 100`,
       [user.id, user.grade || null]
     );
-    return { courses: courses.rows, live_classes: liveClasses.rows, video_hosting_mode: videoHostingMode() };
+    return { courses: courses.rows.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses.rows, video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
   }
 
   const courses = data.courses
@@ -834,7 +871,7 @@ async function listCoursePortal(user) {
       course_title: data.courses.find((course) => course.id === item.course_id)?.title || null,
       enrollment_count: data.live_class_enrollments.filter((enrollment) => enrollment.live_class_id === item.id).length
     }));
-  return { courses, live_classes: liveClasses, video_hosting_mode: videoHostingMode() };
+  return { courses: courses.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses, video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
 }
 
 async function createCourseUpload(user, body) {
@@ -889,7 +926,8 @@ async function createCourseUpload(user, body) {
         );
       }
     }
-    return { course, video_hosting_mode: videoHostingMode(), upload_billing: "video_size_bytes_recorded_for_teacher_fee" };
+    const totalBytes = sections.flatMap((section) => section.lessons || []).reduce((sum, lesson) => sum + Number(lesson.video_size_bytes || 0), 0);
+    return { course, video_hosting_mode: videoHostingMode(), upload_billing: { total_video_size_bytes: totalBytes, estimated_fee: estimateVideoUploadFee(totalBytes), currency: "PKR", rate_sheet: "TBD" } };
   }
 
   const course = {
@@ -921,14 +959,15 @@ async function createCourseUpload(user, body) {
     }
   }
   await saveJsonData();
-  return { course, video_hosting_mode: videoHostingMode(), upload_billing: "video_size_bytes_recorded_for_teacher_fee" };
+  const totalBytes = sections.flatMap((section) => section.lessons || []).reduce((sum, lesson) => sum + Number(lesson.video_size_bytes || 0), 0);
+  return { course, video_hosting_mode: videoHostingMode(), upload_billing: { total_video_size_bytes: totalBytes, estimated_fee: estimateVideoUploadFee(totalBytes), currency: "PKR", rate_sheet: "TBD" } };
 }
 
 async function createLiveClass(user, body) {
   if (!hasRole(user, "teacher")) return { error: "teacher_role_required", message: "Only teachers can create live classes." };
   const title = String(body.title ?? "").trim();
   if (!title) return { error: "live_class_title_required", message: "Live class title is required." };
-  const organizationId = String(body.organization_id ?? "").trim() || null;
+  const organizationId = normalizeOrganizationId(body.organization_id);
   const scheduledAt = String(body.scheduled_at ?? "").trim() || null;
   const courseId = String(body.course_id ?? "").trim() || null;
   const grade = String(body.grade ?? "").trim() || null;
@@ -956,8 +995,12 @@ async function joinLiveClass(user, liveClassId, body) {
     ? (await pgPool.query("select id::text, organization_id::text, grade, is_open from live_classes where id = $1", [liveClassId])).rows[0]
     : data.live_classes.find((item) => item.id === liveClassId);
   if (!liveClass) return undefined;
+  const grade = String(body.grade ?? liveClass.grade ?? "").trim();
   const requiresValidation = Boolean(liveClass.organization_id);
-  const validated = !requiresValidation || Boolean(registrationNumber);
+  const registrationValid = /^[A-Za-z0-9-]{3,}$/.test(registrationNumber);
+  const gradeValid = !liveClass.grade || grade === liveClass.grade;
+  const validated = !requiresValidation || (registrationValid && gradeValid);
+  if (requiresValidation && !validated) return { error: "organization_validation_failed", message: "Registration number, organization, and grade must match." };
   if (pgPool) {
     const result = await pgPool.query(
       `insert into live_class_enrollments (live_class_id, student_id, registration_number, validated, joined_at, device_fingerprint)
@@ -1021,7 +1064,38 @@ async function extractLiveClassKeyPoints(liveClassId, body) {
   const keyPoints = transcript
     ? transcript.split(/[.!?]/).map((item) => item.trim()).filter(Boolean).slice(0, 5)
     : ["Class started", "Teacher shared core explanation", "Review recording and lesson notes"];
-  return { live_class_id: liveClassId, key_points: keyPoints, saved_to_profile: true, notification: "student_fcm", agent: "key-points-agent" };
+  return { live_class_id: liveClassId, key_points: keyPoints, saved_to_profile: true, notification: "student_fcm", agent: "key-points-agent", paid_feature: true };
+}
+
+async function getCourseRoadmap(user, courseId) {
+  const course = pgPool
+    ? (await pgPool.query("select id::text, title, category, is_paid from courses where id = $1", [courseId])).rows[0]
+    : data.courses.find((item) => item.id === courseId);
+  if (!course) return undefined;
+  if (user.subscription_tier !== "premium") return { error: "premium_required", message: "Premium subscription unlocks roadmap, paid courses, and 15 matching jobs." };
+  return buildPremiumRoadmap(course);
+}
+
+async function purchaseCourse(user, courseId) {
+  const course = pgPool
+    ? (await pgPool.query("select id::text, is_paid from courses where id = $1", [courseId])).rows[0]
+    : data.courses.find((item) => item.id === courseId);
+  if (!course) return undefined;
+  if (!course.is_paid) return { status: "free_course_access_granted" };
+  return { purchase: { id: crypto.randomUUID(), course_id: courseId, student_id: user.id, stripe_payment_intent_id: `pi_local_${crypto.randomUUID()}`, created_at: new Date().toISOString() }, payment: "stripe_payment_intent_placeholder" };
+}
+
+async function createCourseLinkedChannel(user, courseId, body) {
+  const course = pgPool
+    ? (await pgPool.query("select id::text, title, teacher_id::text from courses where id = $1", [courseId])).rows[0]
+    : data.courses.find((item) => item.id === courseId);
+  if (!course || course.teacher_id !== user.id) return undefined;
+  return createChannel(user, {
+    name: String(body.name || `${course.title} Channel`),
+    description: String(body.description || "Async course material-sharing space."),
+    organization_id: body.organization_id,
+    grade: body.grade
+  });
 }
 
 function createServer(port, serviceName, handler) {
@@ -1241,7 +1315,7 @@ createServer(4100, "learnlink-service-community", async (req, res) => {
 createServer(4200, "learnlink-service-courses", async (req, res) => {
   const user = await requireAuth(req, res);
   if (!user) return;
-  if (req.method === "GET" && req.url?.startsWith("/courses")) {
+  if (req.method === "GET" && (req.url === "/courses" || req.url?.startsWith("/courses?"))) {
     json(res, 200, await listCoursePortal(user));
     return;
   }
@@ -1254,6 +1328,24 @@ createServer(4200, "learnlink-service-courses", async (req, res) => {
     json(res, 200, { quiz: convertQuizPrompt((await readJson(req)).content), teacher_confirmation_required: true });
     return;
   }
+  if (req.method === "GET" && req.url?.startsWith("/courses/") && req.url.endsWith("/roadmap")) {
+    const courseId = req.url.split("/")[2];
+    const result = await getCourseRoadmap(user, courseId);
+    json(res, !result ? 404 : result.error ? 402 : 200, result || { error: "course_not_found" });
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/courses/") && req.url.endsWith("/purchase")) {
+    const courseId = req.url.split("/")[2];
+    const result = await purchaseCourse(user, courseId);
+    json(res, result ? 201 : 404, result || { error: "course_not_found" });
+    return;
+  }
+  if (req.method === "POST" && req.url?.startsWith("/courses/") && req.url.endsWith("/channel")) {
+    const courseId = req.url.split("/")[2];
+    const result = await createCourseLinkedChannel(user, courseId, await readJson(req));
+    json(res, result ? (result.error ? 400 : 201) : 404, result || { error: "course_not_found_or_not_teacher" });
+    return;
+  }
   if (req.method === "POST" && req.url === "/live-classes") {
     const result = await createLiveClass(user, await readJson(req));
     json(res, result.error ? 400 : 201, result);
@@ -1262,7 +1354,7 @@ createServer(4200, "learnlink-service-courses", async (req, res) => {
   if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/join")) {
     const liveClassId = req.url.split("/")[2];
     const result = await joinLiveClass(user, liveClassId, await readJson(req));
-    json(res, result ? 200 : 404, result || { error: "live_class_not_found" });
+    json(res, !result ? 404 : result.error ? 403 : 200, result || { error: "live_class_not_found" });
     return;
   }
   if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/quizzes/start")) {
@@ -1284,6 +1376,10 @@ createServer(4200, "learnlink-service-courses", async (req, res) => {
   }
   if (req.method === "POST" && req.url?.startsWith("/live-classes/") && req.url.endsWith("/key-points")) {
     const liveClassId = req.url.split("/")[2];
+    if (user.subscription_tier !== "premium") {
+      json(res, 402, { error: "premium_required", message: "Premium profile is required for live class key points." });
+      return;
+    }
     const result = await extractLiveClassKeyPoints(liveClassId, await readJson(req));
     json(res, result.error ? 403 : 200, result);
     return;
@@ -1418,14 +1514,10 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     return;
   }
 
-  if (req.method === "GET" && req.url?.startsWith("/courses")) {
+  if (req.method === "GET" && (req.url === "/courses" || req.url?.startsWith("/courses?"))) {
     const user = await requireAuth(req, res);
     if (!user) return;
-    if (req.url === "/courses" || req.url.startsWith("/courses?")) {
-      json(res, 200, await listCoursePortal(user));
-      return;
-    }
-    json(res, 404, { error: "not_found" });
+    json(res, 200, await listCoursePortal(user));
     return;
   }
 
@@ -1444,6 +1536,33 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     return;
   }
 
+  if (req.method === "GET" && req.url?.startsWith("/courses/") && req.url.endsWith("/roadmap")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const courseId = req.url.split("/")[2];
+    const result = await getCourseRoadmap(user, courseId);
+    json(res, !result ? 404 : result.error ? 402 : 200, result || { error: "course_not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/") && req.url.endsWith("/purchase")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const courseId = req.url.split("/")[2];
+    const result = await purchaseCourse(user, courseId);
+    json(res, result ? 201 : 404, result || { error: "course_not_found" });
+    return;
+  }
+
+  if (req.method === "POST" && req.url?.startsWith("/courses/") && req.url.endsWith("/channel")) {
+    const user = await requireAuth(req, res);
+    if (!user) return;
+    const courseId = req.url.split("/")[2];
+    const result = await createCourseLinkedChannel(user, courseId, await readJson(req));
+    json(res, result ? (result.error ? 400 : 201) : 404, result || { error: "course_not_found_or_not_teacher" });
+    return;
+  }
+
   if (req.method === "POST" && req.url === "/courses/live-classes") {
     const user = await requireAuth(req, res);
     if (!user) return;
@@ -1457,7 +1576,7 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     if (!user) return;
     const liveClassId = req.url.split("/")[3];
     const result = await joinLiveClass(user, liveClassId, await readJson(req));
-    json(res, result ? 200 : 404, result || { error: "live_class_not_found" });
+    json(res, !result ? 404 : result.error ? 403 : 200, result || { error: "live_class_not_found" });
     return;
   }
 
@@ -1491,6 +1610,10 @@ createServer(4000, "learnlink-backend-gateway", async (req, res) => {
     const user = await requireAuth(req, res);
     if (!user) return;
     const liveClassId = req.url.split("/")[3];
+    if (user.subscription_tier !== "premium") {
+      json(res, 402, { error: "premium_required", message: "Premium profile is required for live class key points." });
+      return;
+    }
     const result = await extractLiveClassKeyPoints(liveClassId, await readJson(req));
     json(res, result.error ? 403 : 200, result);
     return;
