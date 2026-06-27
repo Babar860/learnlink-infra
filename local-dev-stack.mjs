@@ -266,18 +266,22 @@ async function requireAuth(req, res) {
   return user;
 }
 
-async function upsertUser({ email, name, roles, password }) {
+async function upsertUser({ email, name, roles, password, organization_id, grade }) {
   const passwordHash = password ? hashPassword(password) : null;
+  const organizationId = normalizeOrganizationId(organization_id);
+  const userGrade = String(grade ?? "").trim() || null;
   if (pgPool) {
     const result = await pgPool.query(
-      `insert into users (email, name, roles, password_hash)
-       values ($1, $2, $3, $4)
+      `insert into users (email, name, roles, password_hash, organization_id, grade)
+       values ($1, $2, $3, $4, $5, $6)
        on conflict (email) do update
        set name = excluded.name,
            roles = excluded.roles,
-           password_hash = coalesce(excluded.password_hash, users.password_hash)
-       returning id, email, name, roles, created_at`,
-      [email, name, roles, passwordHash]
+           password_hash = coalesce(excluded.password_hash, users.password_hash),
+           organization_id = coalesce(excluded.organization_id, users.organization_id),
+           grade = coalesce(excluded.grade, users.grade)
+       returning id, email, name, roles, organization_id::text, grade, subscription_tier, created_at`,
+      [email, name, roles, passwordHash, organizationId, userGrade]
     );
     return result.rows[0];
   }
@@ -287,11 +291,13 @@ async function upsertUser({ email, name, roles, password }) {
     existing.name = name || existing.name;
     existing.roles = roles;
     if (passwordHash) existing.password_hash = passwordHash;
+    if (organizationId) existing.organization_id = organizationId;
+    if (userGrade) existing.grade = userGrade;
     await saveJsonData();
     return existing;
   }
 
-  const user = { id: crypto.randomUUID(), email, name, roles, password_hash: passwordHash, created_at: new Date().toISOString() };
+  const user = { id: crypto.randomUUID(), email, name, roles, password_hash: passwordHash, organization_id: organizationId, grade: userGrade, subscription_tier: "free", created_at: new Date().toISOString() };
   data.users.push(user);
   await saveJsonData();
   return user;
@@ -817,6 +823,9 @@ function buildPremiumRoadmap(course) {
 }
 
 async function listCoursePortal(user) {
+  const isTeacher = hasRole(user, "teacher");
+  const userOrg = user.organization_id ? String(user.organization_id) : null;
+  const userGrade = user.grade ? String(user.grade) : null;
   if (pgPool) {
     const courses = await pgPool.query(
       `select c.id::text, c.title, c.description, c.category, c.teacher_id::text, c.is_paid, c.price,
@@ -828,35 +837,38 @@ async function listCoursePortal(user) {
        left join users u on u.id = c.teacher_id
        left join sections s on s.course_id = c.id
        left join lessons l on l.section_id = s.id
-       where c.is_published = true or c.teacher_id = $1
+       where case when $2::boolean then c.teacher_id = $1 else c.is_published = true end
        group by c.id, u.name
        order by c.created_at desc
        limit 100`,
-      [user.id]
+      [user.id, isTeacher]
     );
     const liveClasses = await pgPool.query(
       `select lc.id::text, lc.teacher_id::text, lc.title, lc.course_id::text, lc.scheduled_at, lc.status, lc.join_link,
               lc.organization_id::text, lc.grade, lc.is_open, lc.created_at,
               coalesce(u.name, 'LearnLink teacher') as teacher_name,
               c.title as course_title,
-              count(distinct e.id)::int as enrollment_count
+              count(distinct e.id)::int as enrollment_count,
+              count(distinct lcq.id)::int as quiz_count
        from live_classes lc
        left join users u on u.id = lc.teacher_id
        left join courses c on c.id = lc.course_id
        left join live_class_enrollments e on e.live_class_id = lc.id
-       where lc.is_open = true
-          or lc.teacher_id = $1
-          or ($2::text is not null and lc.grade = $2)
+       left join live_class_quizzes lcq on lcq.live_class_id = lc.id
+       where case
+          when $2::boolean then lc.teacher_id = $1
+          else lc.is_open = true or (lc.organization_id::text = $3 and ($4::text is null or lc.grade is null or lc.grade = $4))
+       end
        group by lc.id, u.name, c.title
        order by lc.created_at desc
        limit 100`,
-      [user.id, user.grade || null]
+      [user.id, isTeacher, userOrg, userGrade]
     );
-    return { courses: courses.rows.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses.rows, video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
+    return { role_view: isTeacher ? "teacher" : "student", courses: courses.rows.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses.rows.map((item) => ({ ...item, has_quiz: Number(item.quiz_count || 0) > 0 })), video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
   }
 
   const courses = data.courses
-    .filter((course) => course.is_published !== false || course.teacher_id === user.id)
+    .filter((course) => isTeacher ? course.teacher_id === user.id : course.is_published !== false)
     .map((course) => ({
       ...course,
       teacher_name: data.users.find((item) => item.id === course.teacher_id)?.name || "LearnLink teacher",
@@ -864,14 +876,15 @@ async function listCoursePortal(user) {
       lesson_count: data.lessons.filter((lesson) => data.sections.find((section) => section.id === lesson.section_id && section.course_id === course.id)).length
     }));
   const liveClasses = data.live_classes
-    .filter((item) => item.is_open || item.teacher_id === user.id || (user.grade && item.grade === user.grade))
+    .filter((item) => isTeacher ? item.teacher_id === user.id : (item.is_open || (item.organization_id === userOrg && (!item.grade || item.grade === userGrade))))
     .map((item) => ({
       ...item,
       teacher_name: data.users.find((teacher) => teacher.id === item.teacher_id)?.name || "LearnLink teacher",
       course_title: data.courses.find((course) => course.id === item.course_id)?.title || null,
-      enrollment_count: data.live_class_enrollments.filter((enrollment) => enrollment.live_class_id === item.id).length
+      enrollment_count: data.live_class_enrollments.filter((enrollment) => enrollment.live_class_id === item.id).length,
+      has_quiz: data.live_class_quizzes.some((quiz) => quiz.live_class_id === item.id)
     }));
-  return { courses: courses.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses, video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
+  return { role_view: isTeacher ? "teacher" : "student", courses: courses.map((course) => ({ ...course, rank_reason: courseRecommendationMode(user) })), live_classes: liveClasses, video_hosting_mode: videoHostingMode(), discovery_mode: courseRecommendationMode(user) };
 }
 
 async function createCourseUpload(user, body) {
@@ -980,12 +993,15 @@ async function createLiveClass(user, body) {
        returning id::text, teacher_id::text, title, course_id::text, scheduled_at, status, join_link, organization_id::text, grade, is_open, created_at`,
       [user.id, title, courseId, scheduledAt, status, joinLink, organizationId, grade, !organizationId]
     );
-    return { live_class: result.rows[0], reminders: ["student_fcm_15_min_before", "teacher_email_sms"] };
+    const liveClass = result.rows[0];
+    if (body.quiz_prompt) await startLiveQuiz(user, liveClass.id, { prompt: body.quiz_prompt });
+    return { live_class: { ...liveClass, has_quiz: Boolean(body.quiz_prompt) }, reminders: ["student_fcm_15_min_before", "teacher_email_sms"], quiz_billing: body.quiz_prompt ? { estimated_fee: 250, currency: "PKR", bank_details_required: true } : null };
   }
   const liveClass = { id: crypto.randomUUID(), teacher_id: user.id, title, course_id: courseId, scheduled_at: scheduledAt, status, join_link: joinLink, organization_id: organizationId, grade, is_open: !organizationId, created_at: new Date().toISOString() };
   data.live_classes.unshift(liveClass);
+  if (body.quiz_prompt) await startLiveQuiz(user, liveClass.id, { prompt: body.quiz_prompt });
   await saveJsonData();
-  return { live_class: liveClass, reminders: ["student_fcm_15_min_before", "teacher_email_sms"] };
+  return { live_class: { ...liveClass, has_quiz: Boolean(body.quiz_prompt) }, reminders: ["student_fcm_15_min_before", "teacher_email_sms"], quiz_billing: body.quiz_prompt ? { estimated_fee: 250, currency: "PKR", bank_details_required: true } : null };
 }
 
 async function joinLiveClass(user, liveClassId, body) {
@@ -995,11 +1011,11 @@ async function joinLiveClass(user, liveClassId, body) {
     ? (await pgPool.query("select id::text, organization_id::text, grade, is_open from live_classes where id = $1", [liveClassId])).rows[0]
     : data.live_classes.find((item) => item.id === liveClassId);
   if (!liveClass) return undefined;
-  const grade = String(body.grade ?? liveClass.grade ?? "").trim();
   const requiresValidation = Boolean(liveClass.organization_id);
   const registrationValid = /^[A-Za-z0-9-]{3,}$/.test(registrationNumber);
-  const gradeValid = !liveClass.grade || grade === liveClass.grade;
-  const validated = !requiresValidation || (registrationValid && gradeValid);
+  const organizationValid = !requiresValidation || String(user.organization_id || "") === String(liveClass.organization_id || "");
+  const gradeValid = !liveClass.grade || String(user.grade || "") === String(liveClass.grade || "");
+  const validated = !requiresValidation || (registrationValid && organizationValid && gradeValid);
   if (requiresValidation && !validated) return { error: "organization_validation_failed", message: "Registration number, organization, and grade must match." };
   if (pgPool) {
     const result = await pgPool.query(
@@ -1145,7 +1161,7 @@ const handleAuth = async (req, res) => {
       return true;
     }
 
-    const user = await upsertUser({ email, name, roles, password });
+    const user = await upsertUser({ email, name, roles, password, organization_id: body.organization_id, grade: body.grade });
     const token = await createSession(user);
     json(res, 201, { user: publicUser(user), token });
     return true;
